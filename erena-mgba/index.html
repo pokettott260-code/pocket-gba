@@ -343,6 +343,7 @@ hr{border:0; border-top:1px dashed var(--tan); margin:18px 0}
     <p>いつもの「Erena's mGBA」とは別の、ブラウザ専用の軽量版です。GBA / GB / GBC のROMを読み込んで遊べます。アイコンと起動画面は、エレナのイメージカラー（金・サファイア・クリーム）で統一した、シンプルな紋章デザインにしています。</p>
     <p>このHTMLファイル1つにエミュレーター本体（コアとwasm）がすべて入っているので、GitHub Pagesにこのファイルだけを置いてもそのまま動きます。セーブはこのブラウザ内に自動保存され、ファイルへの書き出しもできます。別の端末や、いつもの版とはデータは共有されません。大切なセーブは設定からファイルにも書き出してください。</p>
     <p><strong>ファイルが選べないとき：</strong>選択画面でROMやセーブがグレーになって押せない場合は、そのファイルがまだiCloud上にあるだけのことがあります。「ファイル」アプリで対象のファイルを長押しして「今すぐダウンロード」を選んでから、この画面に戻って選び直してください。</p>
+    <p><strong>大きなROMについて：</strong>PokemonStart（128MB）のような大きなROMは、このエミュレーターのコアが一度に読み込める上限（64MB）に合わせて、先頭64MB分を使って起動します。ゲーム本体はその範囲に収まっていますが、後半のバンクを使う一部要素が正しく表示されない場合があります。</p>
   </section>
 
   <footer class="notice">ROMは端末内だけで処理します · 任天堂とは関係のない非公式プロジェクトです<br>エンジン: mGBA（MPL-2.0）</footer>
@@ -703,6 +704,28 @@ function fileExt(fileName){
   var parts = String(fileName || '').split('.');
   return parts.length > 1 ? parts.pop().toLowerCase() : '';
 }
+/* This mGBA core accepts at most 64MB in one _web_load call and returns 0
+   for anything larger (verified against the bundled core: a 128MB
+   PokemonStart ROM fails whole, its first 64MB loads and boots). Large
+   multi-bank ROMs are therefore loaded by their first 64MB, which holds
+   the game itself and its first data bank. */
+var CORE_ROM_MAX = 64 * 1024 * 1024;
+function hashRom(bytes){
+  function fallback(){
+    /* Only used if SubtleCrypto refuses a very large buffer (seen on iOS
+       with 100MB+ files): sample-based key, stable for the same file. */
+    var h = 0x811c9dc5, step = Math.max(1, Math.floor(bytes.length / 1048576));
+    for (var i = 0; i < bytes.length; i += step) { h ^= bytes[i]; h = Math.imul(h, 0x01000193); }
+    for (var j = Math.max(0, bytes.length - 4096); j < bytes.length; j++) { h ^= bytes[j]; h = Math.imul(h, 0x01000193); }
+    return 'sample-' + bytes.length.toString(16) + '-' + (h >>> 0).toString(16);
+  }
+  if (window.crypto && crypto.subtle && crypto.subtle.digest) {
+    return crypto.subtle.digest('SHA-256', bytes).then(function(hash){
+      return Array.from(new Uint8Array(hash), function(b){ return b.toString(16).padStart(2,'0'); }).join('');
+    }).catch(fallback);
+  }
+  return Promise.resolve(fallback());
+}
 function loadROM(file){
   if (!file || !m || romLoading) return;
   if (['gba','gb','gbc','agb','bin'].indexOf(fileExt(file.name)) < 0) {
@@ -718,9 +741,11 @@ function loadROM(file){
   }).then(function(buf){
     var bytes = new Uint8Array(buf);
     if (bytes.length > 256 * 1024 * 1024) throw new Error('ROMは256MB以下を選んでください');
-    return crypto.subtle.digest('SHA-256', bytes).then(function(hash){
-      romKey = Array.from(new Uint8Array(hash), function(b){ return b.toString(16).padStart(2,'0'); }).join('');
-      var ok = upload(bytes, function(p, n){ return m._web_load(p, n); });
+    return hashRom(bytes).then(function(hash){
+      romKey = hash;
+      var trimmed = bytes.length > CORE_ROM_MAX;
+      var loadBytes = trimmed ? bytes.subarray(0, CORE_ROM_MAX) : bytes;
+      var ok = upload(loadBytes, function(p, n){ return m._web_load(p, n); });
       if (!ok) throw new Error('対応するGBA / GB / GBC ROMを選んでください');
       loaded = true; paused = false; releaseKeys();
       name = file.name;
@@ -731,7 +756,7 @@ function loadROM(file){
       $('empty').hidden = true;
       setControlsEnabled(true);
       updatePauseUI();
-      setStatus(name);
+      setStatus(trimmed ? name + '（大きなROMのため先頭64MBで起動）' : name);
       return idbGet('save:' + romKey).then(function(stored){
         if (stored && stored.bytes) {
           try {
@@ -745,7 +770,7 @@ function loadROM(file){
           $('browser-save-status').textContent = 'このROMのブラウザ保存はまだありません。';
         }
         refreshSlotStatus();
-        toast('ROMを読み込みました');
+        toast(trimmed ? 'ROMを読み込みました（先頭64MB）' : 'ROMを読み込みました');
       });
     });
   }).catch(function(e){
